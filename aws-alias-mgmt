@@ -1,0 +1,250 @@
+#!/usr/bin/env python3
+
+import re
+import sys
+import json
+import boto3
+import logging
+from optparse import OptionParser
+from botocore.exceptions import ClientError
+from botocore.exceptions import EndpointConnectionError
+
+usage = "usage: %prog [options]\n\nExamples:\n  Update target for 'blue' alias: %prog -a U -t al-test-lb-eu -l blue -r us-east-1\n  Create new alias named 'green': %prog -a create -t al-test-lb-eu -l green -r us-east-1\n  Update target for 'green' alias: %prog -a u -t al-test-lb-am -l green -r us-east-1\n  Update target for 'cyan' alias; 'EvaluateTargetHealth' enabled: %prog -a u -t al-test-lb-am -l green -r us-east-1 -e"
+parser = OptionParser(usage=usage)
+parser.add_option("-a", "--action", help="[C]reate, [D]elete, or [U]pdate an alias record")
+parser.add_option("-t", "--target", help="Enter the target load balancer name")
+parser.add_option("-l", "--alias", help="Enter an alias name")
+parser.add_option("-f", action="store_false", dest="targethealth", default=False, help="If specified, do not enable 'EvaluateTargetHealth' [default]")
+parser.add_option("-e", action="store_true", dest="targethealth", help="If specified, enable 'EvaluateTargetHealth'")
+parser.add_option("-r", "--region", help="Enter a valid AWS region")
+
+(options, args) = parser.parse_args()
+action = options.action
+current_lb = options.target
+new_alias = options.alias
+region = options.region
+targetHealth = options.targethealth
+json_dnsname = ""
+challenge = "proceed"
+
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger()
+
+if re.match(action[0], 'c', re.IGNORECASE):
+    action = 'CREATE'
+elif re.match(action[0], 'd', re.IGNORECASE):
+    action = 'DELETE'
+elif re.match(action[0], 'u', re.IGNORECASE):
+    action = 'UPSERT'
+else:
+    print("Please enter a valid action: [C]reate, [D]elete, or [U]pdate.")
+    sys.exit(1)
+
+client = boto3.client('elbv2', region_name = region)
+
+try:
+    response = client.describe_load_balancers()
+except EndpointConnectionError as e:
+    logger.info(f'{e}\nEnsure a proper region was provided or, the AWS environment variable credentials are correct and not expired.')
+    exit(1)
+
+index = 0
+for item in response['LoadBalancers']:
+    if current_lb == (item['LoadBalancerName']):
+        json_dnsname = response['LoadBalancers'][index]['DNSName']
+    else:
+        index +=1
+        pass
+
+client_zone = boto3.client('route53', region_name = region)
+response_zone = client_zone.list_hosted_zones_by_name()
+
+index = 0
+for item in response_zone['HostedZones']:
+    if region in (response_zone['HostedZones'][index]['Name']):
+        json_zoneid = response_zone['HostedZones'][index]['Id']
+        json_zoneid = json_zoneid.translate({ord(c): None for c in "/hostedzone"})
+    else:
+        index +=1
+        pass
+
+if json_dnsname and json_zoneid:
+    
+    print("=========================================================================")
+    print(f"Load Balancer, {current_lb}, has been located\nDNSName: {json_dnsname}")
+    print(f"Route53 Zone ID: {json_zoneid}")
+    print("=========================================================================")
+
+    client_zoneName = boto3.client('ssm', region_name = region)
+    response_zoneName = client_zoneName.get_parameters(Names=['/fdscloud/dns/private_hosted_zone/name'])
+    response_fullDNS = response_zoneName['Parameters'][0]['Value']
+    json_dnsnameRvrs = current_lb + '.' + response_fullDNS
+    json_newAlias = new_alias + '.' + response_fullDNS
+    response_check = client_zone.list_resource_record_sets(HostedZoneId=json_zoneid, StartRecordName=json_newAlias)
+    
+    
+    
+    if len(response_check['ResourceRecordSets']) > 0:
+
+        if json_newAlias == response_check['ResourceRecordSets'][0]['Name'][:-1] or action == "CREATE":
+
+            if action != "CREATE":
+            
+                try:
+                    response_check['ResourceRecordSets'][0]['ResourceRecords']
+                except (KeyError, IndexError):
+
+                    try:
+                        response_check['ResourceRecordSets'][0]['AliasTarget']['DNSName']
+                        proceed = input(f"The following action will be taken:\n    Region: {region}\n    Target Load Balancer: {current_lb}\n    Target DNS Name: {json_dnsnameRvrs}\n    Current DNS Name: {response_check['ResourceRecordSets'][0]['AliasTarget']['DNSName']}\n    Alias: {json_newAlias}\n    Action: {action}\n    Evaluate Target Health: {targetHealth}\nAre you sure you want to proceed? [Y]es/[N]o: ")
+                    except IndexError:
+                        proceed = input(f"The following action will be taken:\n    Region: {region}\n    Target Load Balancer: {current_lb}\n    Target DNS Name: {json_dnsnameRvrs}\n    Current DNS Name: None\n    Alias: {json_newAlias}\n    Action: {action}\n    Evaluate Target Health: {targetHealth}\nAre you sure you want to proceed? [Y]es/[N]o: ")
+
+                    
+                    if re.match(proceed[0], 'y', re.IGNORECASE):
+
+                        print("Performing environment check..")
+                        response_envName = client_zoneName.get_parameters(Names=['/fdscloud/environment'])
+                        response_envName = response_envName['Parameters'][0]['Value']
+
+                        if re.search('[sp][sr][vo][cd]', response_envName, re.IGNORECASE):
+                            challenge = ""
+                            challenge = input(f"Additional confirmation required for {response_envName} environments.\nThe proposed changes may have an unintended impact to dependent services. Please be sure testing has been conducted in dev/uat and that you understand the implications of this change.\nAre you sure you want to proceed? (spell out 'proceed' to continue) ")   
+                        
+                        if challenge != "proceed":
+                            print(f"Aborted. End user input to second challenge was '{challenge}'")
+                            exit(1)
+                        
+                        data = {"Comment": "Creating Alias resource record sets in Route 53", "Changes": [{"Action": "CREATE", "ResourceRecordSet": {"Name": "name", "Type": "A", "AliasTarget": {"HostedZoneId": "zoneid", "DNSName": "dnsna,e", "EvaluateTargetHealth": targetHealth}}}]}
+
+                        data['Changes'][0]['Action'] = action
+                        data['Changes'][0]['ResourceRecordSet']['Name'] = json_newAlias
+                        data['Changes'][0]['ResourceRecordSet']['AliasTarget']['HostedZoneId'] = json_zoneid
+                        data['Changes'][0]['ResourceRecordSet']['AliasTarget']['DNSName'] = json_dnsnameRvrs
+                        print("Attempting change push..") 
+                        
+                        try:      
+                            client_push = client_zone.change_resource_record_sets(HostedZoneId=json_zoneid, ChangeBatch=data)
+                            print(f"Request ID: {client_push['ResponseMetadata']['RequestId']}\nHTTP Status Code: {client_push['ResponseMetadata']['HTTPStatusCode']}")
+                            if client_push['ResponseMetadata']['HTTPStatusCode'] == 200:
+                                response = client_zone.list_resource_record_sets(HostedZoneId=json_zoneid, StartRecordName=json_newAlias)
+                                print(f"Update successful\nAlias Record Info:\n    Alias: {response['ResourceRecordSets'][0]['Name']}\n    DNS Name: {response['ResourceRecordSets'][0]['AliasTarget']['DNSName'][:-1]}")
+                            else:
+                                print(f"Update failed\nHTTP Status Code: {client_push['ResponseMetadata']['HTTPStatusCode']}")
+                        except ClientError as e:
+                            if e.response['Error']['Code'] == 'InvalidChangeBatch':
+                                logger.info(f'{e}')
+
+                    else:
+                        if proceed == "":
+                            print(f"User response was empty, action aborted.")
+                            exit(0)
+                        else:
+                            print(f"User response was '{proceed}', action aborted.")
+                            exit(0)
+                else:
+                    print(f"The specified alias name contains non-alias resource record(s) and may not be changed. Specify a different alias name.\nCurrent resource record: Value={response_check['ResourceRecordSets'][0]['ResourceRecords'][0]['Value']}, Type={response_check['ResourceRecordSets'][0]['Type']}")
+                    exit(1)
+
+            else:
+
+                proceed = input(f"The following action will be taken:\n    Region: {region}\n    Target Load Balancer: {current_lb}\n    Target DNS Name: {json_dnsnameRvrs}\n    Alias: {json_newAlias}\n    Action: {action}\n    Evaluate Target Health: {targetHealth}\nAre you sure you want to proceed? [Y]es/[N]o: ")
+
+                if re.match(proceed[0], 'y', re.IGNORECASE):
+
+                    print("Performing environment check..")
+                    response_envName = client_zoneName.get_parameters(Names=['/fdscloud/environment'])
+                    response_envName = response_envName['Parameters'][0]['Value']
+
+                    if re.search('[sp][sr][vo][cd]', response_envName, re.IGNORECASE):
+                        challenge = ""
+                        challenge = input(f"Additional confirmation required for {response_envName} environments.\nThe proposed changes may have an unintended impact to dependent services. Please be sure testing has been conducted in dev/uat and that you understand the implications of this change.\nAre you sure you want to proceed? (spell out 'proceed' to continue) ")   
+                    
+                    if challenge != "proceed":
+                        print(f"Aborted. End user input to second challenge was '{challenge}'.")
+                        exit(1)
+                    
+                    data = {"Comment": "Creating Alias resource record sets in Route 53", "Changes": [{"Action": "CREATE", "ResourceRecordSet": {"Name": "name", "Type": "A", "AliasTarget": {"HostedZoneId": "zoneid", "DNSName": "dnsna,e", "EvaluateTargetHealth": targetHealth}}}]}
+
+                    data['Changes'][0]['Action'] = action
+                    data['Changes'][0]['ResourceRecordSet']['Name'] = json_newAlias
+                    data['Changes'][0]['ResourceRecordSet']['AliasTarget']['HostedZoneId'] = json_zoneid
+                    data['Changes'][0]['ResourceRecordSet']['AliasTarget']['DNSName'] = json_dnsnameRvrs
+                    print("Attempting change push..") 
+                    
+                    try:      
+                        client_push = client_zone.change_resource_record_sets(HostedZoneId=json_zoneid, ChangeBatch=data)
+                        print(f"Request ID: {client_push['ResponseMetadata']['RequestId']}\nHTTP Status Code: {client_push['ResponseMetadata']['HTTPStatusCode']}")
+                        if client_push['ResponseMetadata']['HTTPStatusCode'] == 200:
+                            response = client_zone.list_resource_record_sets(HostedZoneId=json_zoneid, StartRecordName=json_newAlias)
+                            print(f"Update successful\nAlias Record Info:\n    Alias: {response['ResourceRecordSets'][0]['Name']}\n    DNS Name: {response['ResourceRecordSets'][0]['AliasTarget']['DNSName'][:-1]}")
+                        else:
+                            print(f"Update failed\nHTTP Status Code: {client_push['ResponseMetadata']['HTTPStatusCode']}")
+                    except ClientError as e:
+                        if e.response['Error']['Code'] == 'InvalidChangeBatch':
+                            logger.info(f'{e}')
+
+                else:
+                    if proceed == "":
+                        print(f"User response was empty, action aborted.")
+                        exit(0)
+                    else:
+                        print(f"User response was '{proceed}', action aborted.")
+                        exit(0)
+
+        else:
+            print(f"The alias record, '{json_newAlias}', does not exist. The record must first be created.")
+
+    else:
+
+        if action != "CREATE":
+            print(f"The alias record, '{json_newAlias}', does not exist. The record must first be created.")
+        else:
+            proceed = input(f"The following action will be taken:\n    Region: {region}\n    Target Load Balancer: {current_lb}\n    Target DNS Name: {json_dnsnameRvrs}\n    Alias: {json_newAlias}\n    Action: {action}\n    Evaluate Target Health: {targetHealth}\nAre you sure you want to proceed? [Y]es/[N]o: ")
+
+            if re.match(proceed[0], 'y', re.IGNORECASE):
+
+                print("Performing environment check..")
+                response_envName = client_zoneName.get_parameters(Names=['/fdscloud/environment'])
+                response_envName = response_envName['Parameters'][0]['Value']
+
+                if re.search('[sp][sr][vo][cd]', response_envName, re.IGNORECASE):
+                    challenge = ""
+                    challenge = input(f"Additional confirmation required for {response_envName} environments.\nThe proposed changes may have an unintended impact to dependent services. Please be sure testing has been conducted in dev/uat and that you understand the implications of this change.\nAre you sure you want to proceed? (spell out 'proceed' to continue) ")   
+                
+                if challenge != "proceed":
+                    print(f"Aborted. End user input to second challenge was '{challenge}'.")
+                    exit(1)
+                
+                data = {"Comment": "Creating Alias resource record sets in Route 53", "Changes": [{"Action": "CREATE", "ResourceRecordSet": {"Name": "name", "Type": "A", "AliasTarget": {"HostedZoneId": "zoneid", "DNSName": "dnsna,e", "EvaluateTargetHealth": targetHealth}}}]}
+
+                data['Changes'][0]['Action'] = action
+                data['Changes'][0]['ResourceRecordSet']['Name'] = json_newAlias
+                data['Changes'][0]['ResourceRecordSet']['AliasTarget']['HostedZoneId'] = json_zoneid
+                data['Changes'][0]['ResourceRecordSet']['AliasTarget']['DNSName'] = json_dnsnameRvrs
+                print("Attempting change push..") 
+                
+                try:      
+                    client_push = client_zone.change_resource_record_sets(HostedZoneId=json_zoneid, ChangeBatch=data)
+                    print(f"Request ID: {client_push['ResponseMetadata']['RequestId']}\nHTTP Status Code: {client_push['ResponseMetadata']['HTTPStatusCode']}")
+                    if client_push['ResponseMetadata']['HTTPStatusCode'] == 200:
+                        response = client_zone.list_resource_record_sets(HostedZoneId=json_zoneid, StartRecordName=json_newAlias)
+                        print(f"Update successful\nAlias Record Info:\n    Alias: {response['ResourceRecordSets'][0]['Name']}\n    DNS Name: {response['ResourceRecordSets'][0]['AliasTarget']['DNSName'][:-1]}")
+                    else:
+                        print(f"Update failed\nHTTP Status Code: {client_push['ResponseMetadata']['HTTPStatusCode']}")
+                except ClientError as e:
+                    if e.response['Error']['Code'] == 'InvalidChangeBatch':
+                        logger.info(f'{e}')
+
+            else:
+                if proceed == "":
+                    print(f"User response was empty, action aborted.")
+                    exit(0)
+                else:
+                    print(f"User response was '{proceed}', action aborted.")
+                    exit(0)
+
+
+else:
+    print(f"Terminating. The specified load balancer was not located or does not exist. Ensure the load balancer exists with an alias record.\n    Load Balancer Name: {current_lb}\n    Zone ID: {json_zoneid}\n    Region: {region}")
+    exit(1)
