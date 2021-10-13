@@ -7,7 +7,7 @@ __license__ = "MIT"
 __version__ = "1.0.0-ALPHA"
 __maintainer__ = "Adam M. Lechnos"
 __email__ = "email@adamlechnos.com"
-__status__ = "Development"
+__status__ = "Prototype"
 
 import re
 import sys
