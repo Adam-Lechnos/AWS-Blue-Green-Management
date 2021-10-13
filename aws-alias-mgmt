@@ -4,7 +4,7 @@ __author__ = "Adam M. Lechnos"
 __copyright__ = "Copyright 2021"
 
 __license__ = "MIT"
-__version__ = "1.0.0-ALPHA"
+__version__ = "1.0.0-alpha"
 __maintainer__ = "Adam M. Lechnos"
 __email__ = "email@adamlechnos.com"
 __status__ = "Prototype"
